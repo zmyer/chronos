@@ -9,7 +9,7 @@ import org.apache.mesos.Protos.ContainerInfo.DockerInfo
 import org.apache.mesos.Protos.Environment.Variable
 import org.apache.mesos.Protos._
 import org.apache.mesos.chronos.scheduler.config.SchedulerConfiguration
-import org.apache.mesos.chronos.scheduler.jobs.{BaseJob, ContainerType, Fetch, TaskUtils}
+import org.apache.mesos.chronos.scheduler.jobs.{Volume => _, _}
 
 import scala.collection.JavaConverters._
 import scala.collection.Map
@@ -51,10 +51,13 @@ class MesosTaskBuilder @Inject()(val conf: SchedulerConfiguration) {
     builder.build()
   }
 
-  def getMesosTaskInfoBuilder(taskIdStr: String, job: BaseJob, offer: Offer): TaskInfo.Builder = {
+  def getMesosTaskInfoBuilder(taskIdStr: String,
+                              job: BaseJob,
+                              offer: Offer): TaskInfo.Builder = {
     //TODO(FL): Allow adding more fine grained resource controls.
     val taskId = TaskID.newBuilder().setValue(taskIdStr).build()
-    val taskInfo = TaskInfo.newBuilder()
+    val taskInfo = TaskInfo
+      .newBuilder()
       .setName(taskNameTemplate.format(job.name))
       .setTaskId(taskId)
     val environment = envs(taskIdStr, job, offer)
@@ -63,28 +66,47 @@ class MesosTaskBuilder @Inject()(val conf: SchedulerConfiguration) {
       Fetch(_)
     }
     val uriCommand = fetch.map { f =>
-      CommandInfo.URI.newBuilder()
+      val builder = CommandInfo.URI
+        .newBuilder()
         .setValue(f.uri)
         .setExtract(f.extract)
         .setExecutable(f.executable)
         .setCache(f.cache)
-        .build()
+      if (f.output_file.nonEmpty) {
+        builder.setOutputFile(f.output_file)
+      }
+      builder.build
     }
 
     if (job.executor.nonEmpty) {
       appendExecutorData(taskInfo, job, environment, uriCommand)
     } else {
-      val command = CommandInfo.newBuilder()
-      if (job.command.startsWith("http") || job.command.startsWith("ftp")) {
-        val uri1 = CommandInfo.URI.newBuilder()
-          .setValue(job.command)
-          .setExecutable(true).build()
+      val jobArguments = TaskUtils.getJobArgumentsForTaskId(taskId.getValue)
+      val jobWithCommand = if (jobArguments != null && !jobArguments.isEmpty) {
+        JobUtils.getJobWithArguments(job, jobArguments)
+      } else {
+        job
+      }
 
-        command.addUris(uri1)
-          .setValue("\"." + job.command.substring(job.command.lastIndexOf("/")) + "\"")
+      val command = CommandInfo.newBuilder()
+      if (jobWithCommand.command.startsWith("http") || jobWithCommand.command
+            .startsWith("ftp")) {
+        val uri1 = CommandInfo.URI
+          .newBuilder()
+          .setValue(jobWithCommand.command)
+          .setExecutable(true)
+          .build()
+
+        command
+          .addUris(uri1)
+          .setValue("\"." + jobWithCommand.command.substring(
+            jobWithCommand.command.lastIndexOf("/")) + "\"")
           .setEnvironment(environment)
       } else {
-        command.setValue(job.command)
+        val jobHasCmd = !jobWithCommand.command.isEmpty
+        if (jobHasCmd) command.setValue(jobWithCommand.command)
+
+        command
           .setShell(job.shell)
           .setEnvironment(environment)
           .addAllArguments(job.arguments.asJava)
@@ -110,10 +132,13 @@ class MesosTaskBuilder @Inject()(val conf: SchedulerConfiguration) {
     taskInfo
   }
 
-  def envs(taskIdStr: String, job: BaseJob, offer: Offer): Environment.Builder = {
+  def envs(taskIdStr: String,
+           job: BaseJob,
+           offer: Offer): Environment.Builder = {
     val (_, start, attempt, _) = TaskUtils.parseTaskId(taskIdStr)
     val baseEnv = Map(
       "mesos_task_id" -> taskIdStr,
+      "MESOS_TASK_ID" -> taskIdStr,
       "CHRONOS_JOB_OWNER" -> job.owner,
       "CHRONOS_JOB_NAME" -> job.name,
       "HOST" -> offer.getHostname,
@@ -127,16 +152,19 @@ class MesosTaskBuilder @Inject()(val conf: SchedulerConfiguration) {
     // If the job defines custom environment variables, add them to the builder
     // Don't add them if they already exist to prevent overwriting the defaults
     val finalEnv =
-    if (job.environmentVariables != null && job.environmentVariables.nonEmpty) {
-      job.environmentVariables.foldLeft(baseEnv)((envs, env) =>
-        if (envs.contains(env.name)) envs else envs + (env.name -> env.value)
-      )
-    } else {
-      baseEnv
-    }
+      if (job.environmentVariables != null && job.environmentVariables.nonEmpty) {
+        job.environmentVariables.foldLeft(baseEnv)(
+          (envs, env) =>
+            if (envs.contains(env.name)) envs
+            else envs + (env.name -> env.value))
+      } else {
+        baseEnv
+      }
 
-    finalEnv.foldLeft(Environment.newBuilder())((builder, env) =>
-      builder.addVariables(Variable.newBuilder().setName(env._1).setValue(env._2)))
+    finalEnv.foldLeft(Environment.newBuilder())(
+      (builder, env) =>
+        builder.addVariables(
+          Variable.newBuilder().setName(env._1).setValue(env._2)))
   }
 
   def scalarResource(name: String, value: Double, offer: Offer) = {
@@ -145,8 +173,12 @@ class MesosTaskBuilder @Inject()(val conf: SchedulerConfiguration) {
     // Give preference to reserved offers first (those whose roles do not match "*")
     import scala.collection.JavaConverters._
     val resources = offer.getResourcesList.asScala
-    val reservedResources = resources.filter({ x => x.hasRole && x.getRole != "*" })
-    val reservedResource = reservedResources.find({ x => x.getName == name && x.getScalar.getValue >= value })
+    val reservedResources = resources.filter({ x =>
+      x.hasRole && x.getRole != "*"
+    })
+    val reservedResource = reservedResources.find({ x =>
+      x.getName == name && x.getScalar.getValue >= value
+    })
     val role = reservedResource match {
       case Some(x) =>
         // We found a good candidate earlier, just use that.
@@ -165,84 +197,114 @@ class MesosTaskBuilder @Inject()(val conf: SchedulerConfiguration) {
 
   def createContainerInfo(job: BaseJob): ContainerInfo = {
     val builder = ContainerInfo.newBuilder()
-    job.container.volumes.map { v =>
-      val volumeBuilder = Volume.newBuilder().setContainerPath(v.containerPath)
-      v.hostPath.map { h =>
-        volumeBuilder.setHostPath(h)
-      }
+    job.container.volumes
+      .map { v =>
+        val volumeBuilder =
+          Volume.newBuilder().setContainerPath(v.containerPath)
+        v.hostPath.map { h =>
+          volumeBuilder.setHostPath(h)
+        }
 
-      v.mode.map { m =>
-        volumeBuilder.setMode(Volume.Mode.valueOf(m.toString.toUpperCase))
-      }
-      v.external.foreach { e =>
-        volumeBuilder.setSource(Volume.Source.newBuilder()
-            .setType(Volume.Source.Type.DOCKER_VOLUME)
-            .setDockerVolume(Volume.Source.DockerVolume.newBuilder()
-              .setDriver(e.provider)
-              .setName(e.name)
-              .setDriverOptions(Parameters.newBuilder()
-                .addAllParameter(e.options.map(_.toProto()).asJava).build()
-              ).build()
-            ).build()
-        ).build()
-      }
+        v.mode.map { m =>
+          volumeBuilder.setMode(Volume.Mode.valueOf(m.toString.toUpperCase))
+        }
+        v.external.foreach { e =>
+          volumeBuilder
+            .setSource(
+              Volume.Source
+                .newBuilder()
+                .setType(Volume.Source.Type.DOCKER_VOLUME)
+                .setDockerVolume(
+                  Volume.Source.DockerVolume
+                    .newBuilder()
+                    .setDriver(e.provider)
+                    .setName(e.name)
+                    .setDriverOptions(Parameters
+                      .newBuilder()
+                      .addAllParameter(e.options.map(_.toProto()).asJava)
+                      .build())
+                    .build())
+                .build())
+            .build()
+        }
 
-      volumeBuilder.build()
-    }.foreach(builder.addVolumes)
+        volumeBuilder.build()
+      }
+      .foreach(builder.addVolumes)
 
     job.container.`type` match {
       case ContainerType.DOCKER =>
         builder.setType(ContainerInfo.Type.DOCKER)
-        builder.setDocker(DockerInfo.newBuilder()
-          .setImage(job.container.image)
-          .setNetwork(DockerInfo.Network.valueOf(job.container.network.toString.toUpperCase))
-          .setForcePullImage(job.container.forcePullImage)
-          .addAllParameters(job.container.parameters.map(_.toProto()).asJava)
-          .build())
+        builder.setDocker(
+          DockerInfo
+            .newBuilder()
+            .setImage(job.container.image)
+            .setNetwork(DockerInfo.Network.valueOf(
+              job.container.network.toString.toUpperCase))
+            .setForcePullImage(job.container.forcePullImage)
+            .addAllParameters(job.container.parameters.map(_.toProto()).asJava)
+            .build())
       case ContainerType.MESOS =>
         builder.setType(ContainerInfo.Type.MESOS)
-        builder.setMesos(ContainerInfo.MesosInfo.newBuilder()
-          .setImage(Image.newBuilder()
-            // TODO add APPC image support
-            .setType(Image.Type.DOCKER)
-            .setDocker(Image.Docker.newBuilder()
-              .setName(job.container.image)
-              // TODO add setCredential
-              .build())
-            .setCached(!job.container.forcePullImage)
+        builder.setMesos(
+          ContainerInfo.MesosInfo
+            .newBuilder()
+            .setImage(
+              Image
+                .newBuilder()
+                // TODO add APPC image support
+                .setType(Image.Type.DOCKER)
+                .setDocker(
+                  Image.Docker
+                    .newBuilder()
+                    .setName(job.container.image)
+                    // TODO add setCredential
+                    .build())
+                .setCached(!job.container.forcePullImage)
+                .build())
             .build())
+    }
+    job.container.networkName.foreach { n =>
+      builder.addNetworkInfos(
+        NetworkInfo
+          .newBuilder()
+          .setName(n)
           .build())
     }
-    job.container.networkName.foreach {
-      n => builder.addNetworkInfos(NetworkInfo.newBuilder()
-          .setName(n).build()
-        )
-    }
 
-    job.container.networkInfos.foreach {
-      n => builder.addNetworkInfos(NetworkInfo.newBuilder()
-        .setName(n.name)
-        .setLabels(Labels.newBuilder()
-          .addAllLabels(n.labels.map(_.toProto()).asJava).build()
-        )
-        // TODO add protocol, portMappings, requires mesos >= 1.1.0
-        .build()
-      )
+    job.container.networkInfos.foreach { n =>
+      builder.addNetworkInfos(
+        NetworkInfo
+          .newBuilder()
+          .setName(n.name)
+          .setLabels(
+            Labels
+              .newBuilder()
+              .addAllLabels(n.labels.map(_.toProto()).asJava)
+              .build())
+          // TODO add protocol, portMappings, requires mesos >= 1.1.0
+          .build())
     }
 
     builder.build
   }
 
-  private def appendExecutorData(taskInfo: TaskInfo.Builder, job: BaseJob, environment: Environment.Builder, uriProtos: Seq[CommandInfo.URI]) {
-    log.info("Appending executor:" + job.executor + ", flags:" + job.executorFlags + ", command:" + job.command)
-    val command = CommandInfo.newBuilder()
+  private def appendExecutorData(taskInfo: TaskInfo.Builder,
+                                 job: BaseJob,
+                                 environment: Environment.Builder,
+                                 uriProtos: Seq[CommandInfo.URI]) {
+    log.info(
+      "Appending executor:" + job.executor + ", flags:" + job.executorFlags + ", command:" + job.command)
+    val command = CommandInfo
+      .newBuilder()
       .setValue(job.executor)
       .setEnvironment(environment)
       .addAllUris(uriProtos.asJava)
     if (job.runAsUser.nonEmpty) {
       command.setUser(job.runAsUser)
     }
-    val executor = ExecutorInfo.newBuilder()
+    val executor = ExecutorInfo
+      .newBuilder()
       .setExecutorId(ExecutorID.newBuilder().setValue(job.name))
       .setCommand(command.build())
     if (job.container != null) {
